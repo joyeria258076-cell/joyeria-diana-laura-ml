@@ -80,8 +80,20 @@ def recomendar():
                     if rec not in productos_carrito:
                         recomendaciones.add(rec)
 
+        # Buscar IDs de los productos recomendados
+        nombres = list(recomendaciones)
+        conn2 = get_connection()
+        cur2 = conn2.cursor()
+        resultado = []
+        for nombre in nombres:
+            cur2.execute("SELECT id FROM productos WHERE nombre = %s LIMIT 1", (nombre,))
+            row = cur2.fetchone()
+            resultado.append({ "nombre": nombre, "id": row[0] if row else None })
+        cur2.close()
+        conn2.close()
+
         return jsonify({
-            "recomendaciones": list(recomendaciones),
+            "recomendaciones": resultado,
             "basado_en": productos_carrito,
             "total_tickets_analizados": len(tickets)
         })

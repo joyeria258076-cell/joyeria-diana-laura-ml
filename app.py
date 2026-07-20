@@ -26,13 +26,15 @@ def obtener_productos():
             c.nombre AS categoria,
             p.peso_gramos,
             p.dias_fabricacion,
-            p.permite_personalizacion
+            p.permite_personalizacion,
+            p.imagen_principal,
+            p.precio_venta
         FROM productos p
         JOIN categorias c ON p.categoria_id = c.id
         WHERE p.activo = true
         ORDER BY p.id
     """)
-    columnas = ['id', 'nombre', 'material_principal', 'categoria', 'peso_gramos', 'dias_fabricacion', 'permite_personalizacion']
+    columnas = ['id', 'nombre', 'material_principal', 'categoria', 'peso_gramos', 'dias_fabricacion', 'permite_personalizacion', 'imagen_principal', 'precio_venta']
     rows = cur.fetchall()
     cur.close()
     conn.close()
@@ -84,7 +86,13 @@ def productos_similares(producto_id, df, sim_matrix, excluir_nombres, top_n=3):
         nombre = df.iloc[i]['nombre']
         if nombre in excluir_nombres:
             continue
-        resultado.append({ "id": int(df.iloc[i]['id']), "nombre": nombre, "similitud": round(float(score), 4) })
+        resultado.append({
+            "id": int(df.iloc[i]['id']),
+            "nombre": nombre,
+            "imagen_principal": df.iloc[i]['imagen_principal'],
+            "precio_venta": float(df.iloc[i]['precio_venta']) if df.iloc[i]['precio_venta'] is not None else None,
+            "similitud": round(float(score), 4)
+        })
         if len(resultado) >= top_n:
             break
     return resultado
@@ -123,7 +131,12 @@ def recomendar():
                     candidatos[item['nombre']] = item
 
         resultado = sorted(candidatos.values(), key=lambda x: x['similitud'], reverse=True)[:5]
-        resultado = [{ "id": r["id"], "nombre": r["nombre"] } for r in resultado]
+        resultado = [{
+            "id": r["id"],
+            "nombre": r["nombre"],
+            "imagen_principal": r["imagen_principal"],
+            "precio_venta": r["precio_venta"]
+        } for r in resultado]
 
         return jsonify({
             "recomendaciones": resultado,

@@ -1,7 +1,7 @@
 import os
 import psycopg2
 import pandas as pd
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -42,15 +42,30 @@ def obtener_productos():
 def calcular_similitud(df):
     df_features = df.copy()
 
-    le_material = LabelEncoder()
-    le_categoria = LabelEncoder()
+    # One-Hot Encoding para variables categóricas SIN orden real (material, categoría).
+    # LabelEncoder no es correcto aquí: asignaría números arbitrarios (ej. Plata=4, Oro=2)
+    # que el algoritmo interpretaría como si tuvieran una relación de orden/distancia real.
+    dummies_material = pd.get_dummies(df_features['material_principal'], prefix='material')
+    dummies_categoria = pd.get_dummies(df_features['categoria'], prefix='categoria')
 
-    df_features['material_enc'] = le_material.fit_transform(df['material_principal'])
-    df_features['categoria_enc'] = le_categoria.fit_transform(df['categoria'])
     df_features['personalizacion_enc'] = df['permite_personalizacion'].astype(int)
 
-    feature_cols = ['material_enc', 'categoria_enc', 'peso_gramos', 'dias_fabricacion', 'personalizacion_enc']
-    X = df_features[feature_cols].values
+    # Estandarización de variables numéricas (media 0, desviación 1).
+    # Sin esto, peso_gramos (rango ~1 a 12) dominaría el cálculo frente a las columnas
+    # binarias de One-Hot (rango 0 a 1), sesgando la similitud coseno.
+    numericas = df_features[['peso_gramos', 'dias_fabricacion']]
+    numericas_escaladas = pd.DataFrame(
+        StandardScaler().fit_transform(numericas),
+        columns=['peso_gramos_esc', 'dias_fabricacion_esc'],
+        index=df_features.index
+    )
+
+    X = pd.concat([
+        dummies_material,
+        dummies_categoria,
+        numericas_escaladas,
+        df_features['personalizacion_enc']
+    ], axis=1).values
 
     return cosine_similarity(X)
 

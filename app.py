@@ -119,6 +119,36 @@ def recomendar():
     except Exception as e:
         return jsonify({ "error": str(e) }), 500
 
+@app.route('/similitudes', methods=['GET'])
+def ver_similitudes():
+    """
+    Endpoint de verificación, abrible directo en el navegador (GET).
+    Muestra, para cada producto activo del catálogo, sus 3 productos más similares
+    según el modelo Content-Based Filtering (similitud coseno).
+    """
+    try:
+        df = obtener_productos()
+
+        if len(df) < 2:
+            return jsonify({ "resultado": [], "mensaje": "Catálogo insuficiente" })
+
+        sim_matrix = calcular_similitud(df)
+
+        resultado = []
+        for _, row in df.iterrows():
+            similares = productos_similares(row['id'], df, sim_matrix, excluir_nombres=set(), top_n=3)
+            resultado.append({
+                "producto": row['nombre'],
+                "material": row['material_principal'],
+                "categoria": row['categoria'],
+                "similares": similares
+            })
+
+        return jsonify({ "algoritmo": "content-based-filtering-coseno", "total_productos": len(df), "resultado": resultado })
+
+    except Exception as e:
+        return jsonify({ "error": str(e) }), 500
+
 if __name__ == '__main__':
     port = int(os.getenv("PORT", 5001))
     app.run(debug=True, port=port)

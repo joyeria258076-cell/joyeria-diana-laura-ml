@@ -3,6 +3,8 @@ import psycopg2
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import cross_val_score, KFold
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -97,6 +99,63 @@ def productos_similares(producto_id, df, sim_matrix, excluir_nombres, top_n=3):
             break
     return resultado
 
+def entrenar_modelo_precio(df):
+    """
+    Entrena un RandomForestRegressor sobre el catalogo activo (precio_venta como Y).
+    Mismo criterio de preprocesamiento que calcular_similitud: One-Hot para variables
+    categoricas sin orden real, StandardScaler para variables numericas.
+    """
+    df_features = df.copy()
+
+    dummies_material = pd.get_dummies(df_features['material_principal'], prefix='material')
+    dummies_categoria = pd.get_dummies(df_features['categoria'], prefix='categoria')
+    df_features['personalizacion_enc'] = df['permite_personalizacion'].astype(int)
+
+    numericas = df_features[['peso_gramos', 'dias_fabricacion']]
+    scaler = StandardScaler()
+    numericas_escaladas = pd.DataFrame(
+        scaler.fit_transform(numericas),
+        columns=['peso_gramos_esc', 'dias_fabricacion_esc'],
+        index=df_features.index
+    )
+
+    X = pd.concat([dummies_material, dummies_categoria, numericas_escaladas, df_features['personalizacion_enc']], axis=1)
+    y = df['precio_venta'].astype(float)
+
+    modelo_rf = RandomForestRegressor(n_estimators=200, max_depth=8, random_state=42)
+    modelo_rf.fit(X, y)
+
+    # MAE por validacion cruzada, usado como margen del rango sugerido (mas robusto que un solo split)
+    n_folds = min(5, len(X))
+    mae = None
+    if n_folds >= 2:
+        kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+        mae_scores = -cross_val_score(modelo_rf, X, y, cv=kf, scoring='neg_mean_absolute_error')
+        mae = float(mae_scores.mean())
+
+    return modelo_rf, scaler, list(X.columns), mae
+
+def predecir_precio_producto(modelo_rf, scaler, columnas_X, material, categoria, peso_gramos, dias_fabricacion, permite_personalizacion):
+    fila = pd.DataFrame([{
+        'material_principal': material,
+        'categoria': categoria,
+        'peso_gramos': peso_gramos,
+        'dias_fabricacion': dias_fabricacion,
+        'permite_personalizacion': permite_personalizacion
+    }])
+
+    dummies_mat = pd.get_dummies(fila['material_principal'], prefix='material')
+    dummies_cat = pd.get_dummies(fila['categoria'], prefix='categoria')
+    fila['personalizacion_enc'] = fila['permite_personalizacion'].astype(int)
+
+    numericas_fila = scaler.transform(fila[['peso_gramos', 'dias_fabricacion']])
+    numericas_fila = pd.DataFrame(numericas_fila, columns=['peso_gramos_esc', 'dias_fabricacion_esc'])
+
+    fila_X = pd.concat([dummies_mat, dummies_cat, numericas_fila, fila['personalizacion_enc']], axis=1)
+    fila_X = fila_X.reindex(columns=columnas_X, fill_value=0)
+
+    return float(modelo_rf.predict(fila_X)[0])
+
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({ "status": "ok", "servicio": "recomendacion", "algoritmo": "content-based-filtering-coseno" })
@@ -142,6 +201,48 @@ def recomendar():
             "recomendaciones": resultado,
             "basado_en": productos_carrito,
             "total_productos_catalogo": len(df)
+        })
+
+    except Exception as e:
+        return jsonify({ "error": str(e) }), 500
+
+@app.route('/predecir-precio', methods=['POST'])
+def predecir_precio():
+    data = request.get_json() or {}
+
+    material_principal = data.get('material_principal')
+    categoria_nombre = data.get('categoria_nombre')
+    peso_gramos = data.get('peso_gramos')
+    dias_fabricacion = data.get('dias_fabricacion', 0)
+    permite_personalizacion = data.get('permite_personalizacion', False)
+
+    if not material_principal or not categoria_nombre or peso_gramos is None:
+        return jsonify({ "error": "Faltan campos: material_principal, categoria_nombre y peso_gramos son obligatorios" }), 400
+
+    try:
+        df = obtener_productos()
+
+        if len(df) < 5:
+            return jsonify({ "error": "Catálogo insuficiente para entrenar el modelo de precio" }), 400
+
+        modelo_rf, scaler, columnas_X, mae = entrenar_modelo_precio(df)
+
+        precio_sugerido = predecir_precio_producto(
+            modelo_rf, scaler, columnas_X,
+            material_principal, categoria_nombre,
+            float(peso_gramos), float(dias_fabricacion), bool(permite_personalizacion)
+        )
+
+        margen = mae if mae is not None else precio_sugerido * 0.15
+        rango_min = max(0, precio_sugerido - margen)
+        rango_max = precio_sugerido + margen
+
+        return jsonify({
+            "precio_sugerido": round(precio_sugerido, 2),
+            "rango_min": round(rango_min, 2),
+            "rango_max": round(rango_max, 2),
+            "margen_error_promedio": round(margen, 2),
+            "total_productos_entrenamiento": len(df)
         })
 
     except Exception as e:

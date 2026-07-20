@@ -248,6 +248,50 @@ def predecir_precio():
     except Exception as e:
         return jsonify({ "error": str(e) }), 500
 
+@app.route('/precios-ejemplo', methods=['GET'])
+def ver_precios_ejemplo():
+    """
+    Endpoint de verificación, abrible directo en el navegador (GET).
+    Entrena el modelo de precio y muestra predicciones para combinaciones
+    de ejemplo (una por cada material x categoria real del catalogo),
+    sin necesidad de Postman.
+    """
+    try:
+        df = obtener_productos()
+
+        if len(df) < 5:
+            return jsonify({ "resultado": [], "mensaje": "Catálogo insuficiente" })
+
+        modelo_rf, scaler, columnas_X, mae = entrenar_modelo_precio(df)
+
+        materiales = sorted(df['material_principal'].unique())
+        categorias = sorted(df['categoria'].unique())
+
+        resultado = []
+        for material in materiales:
+            for categoria in categorias:
+                precio = predecir_precio_producto(
+                    modelo_rf, scaler, columnas_X,
+                    material, categoria, peso_gramos=5.0, dias_fabricacion=0, permite_personalizacion=False
+                )
+                resultado.append({
+                    "material": material,
+                    "categoria": categoria,
+                    "peso_gramos_usado": 5.0,
+                    "precio_sugerido": round(precio, 2)
+                })
+
+        return jsonify({
+            "algoritmo": "random-forest-regressor",
+            "total_productos_entrenamiento": len(df),
+            "mae_validacion_cruzada": round(mae, 2) if mae is not None else None,
+            "nota": "Ejemplos calculados con peso_gramos=5.0 fijo, para comparar el efecto de material y categoria",
+            "resultado": resultado
+        })
+
+    except Exception as e:
+        return jsonify({ "error": str(e) }), 500
+
 @app.route('/similitudes', methods=['GET'])
 def ver_similitudes():
     """

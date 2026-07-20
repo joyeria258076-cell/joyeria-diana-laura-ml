@@ -102,11 +102,16 @@ def productos_similares(producto_id, df, sim_matrix, excluir_nombres, top_n=3):
         nombre = df.iloc[i]['nombre']
         if nombre in excluir_nombres:
             continue
+        imagen = df.iloc[i]['imagen_principal']
+        precio = df.iloc[i]['precio_venta']
         resultado.append({
             "id": int(df.iloc[i]['id']),
             "nombre": nombre,
-            "imagen_principal": df.iloc[i]['imagen_principal'],
-            "precio_venta": float(df.iloc[i]['precio_venta']) if df.iloc[i]['precio_venta'] is not None else None,
+            # pd.notna() detecta tanto None como NaN (float). Sin esto, un producto sin
+            # imagen (ej. los sinteticos [DEMO]) generaria "NaN" literal en el JSON, que
+            # no es JSON valido y hace que JSON.parse() del navegador rompa toda la respuesta.
+            "imagen_principal": imagen if pd.notna(imagen) else None,
+            "precio_venta": float(precio) if pd.notna(precio) else None,
             "similitud": round(float(score), 4)
         })
         if len(resultado) >= top_n:

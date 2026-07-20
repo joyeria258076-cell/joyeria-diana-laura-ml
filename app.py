@@ -5,6 +5,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import cross_val_score, KFold
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -21,6 +23,10 @@ CORS(app)
 # solicitud pague el costo completo y las siguientes respondan casi al instante.
 _cache_modelo_precio = { "timestamp": 0, "total_productos": None, "modelo_rf": None, "scaler": None, "columnas_X": None, "mae": None }
 CACHE_TTL_SEGUNDOS = 300
+
+# Cache del resultado de segmentacion (K-Means). Se recalcula si cambia el numero
+# de clientes o pasan mas de CACHE_TTL_SEGUNDOS.
+_cache_segmentacion = { "timestamp": 0, "total_clientes": None, "resultado": None }
 
 def get_connection():
     return psycopg2.connect(os.getenv("DATABASE_URL"))
@@ -283,6 +289,164 @@ def predecir_precio():
             "rango_max": round(rango_max, 2),
             "margen_error_promedio": round(margen, 2),
             "total_productos_entrenamiento": len(df)
+        })
+
+    except Exception as e:
+        return jsonify({ "error": str(e) }), 500
+
+def obtener_clientes():
+    """
+    Perfil de comportamiento por cliente. Usa CTEs independientes por tabla
+    (compras, apartados, puntualidad) en vez de un JOIN directo de las 3 tablas,
+    para evitar el "fan-out" que inflaria AVG(ventas.total) en clientes con
+    varios apartados.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        WITH compras AS (
+            SELECT cliente_id, COUNT(*) AS num_compras, AVG(total) AS ticket_promedio
+            FROM ventas
+            GROUP BY cliente_id
+        ),
+        apartados_cli AS (
+            SELECT cliente_id, COUNT(*) AS num_apartados, AVG(monto_total) AS monto_apartado_promedio
+            FROM apartados
+            GROUP BY cliente_id
+        ),
+        puntualidad AS (
+            SELECT a.cliente_id,
+                COALESCE(
+                    COUNT(ab.id) FILTER (WHERE ab.estado = 'pagado' AND ab.fecha_abono <= ab.fecha_limite_siguiente)::numeric
+                    / NULLIF(COUNT(ab.id), 0),
+                    0.5
+                ) AS puntualidad_pago
+            FROM apartados a
+            LEFT JOIN abonos ab ON ab.apartado_id = a.id
+            GROUP BY a.cliente_id
+        )
+        SELECT
+            c.id AS cliente_id,
+            c.nombre,
+            COALESCE(co.num_compras, 0) AS num_compras,
+            COALESCE(co.ticket_promedio, 0) AS ticket_promedio,
+            COALESCE(ap.num_apartados, 0) AS num_apartados,
+            COALESCE(ap.monto_apartado_promedio, 0) AS monto_apartado_promedio,
+            CASE WHEN COALESCE(ap.num_apartados, 0) > 0 THEN 1 ELSE 0 END AS usa_apartados,
+            COALESCE(pu.puntualidad_pago, 0.5) AS puntualidad_pago
+        FROM clientes c
+        LEFT JOIN compras co ON co.cliente_id = c.id
+        LEFT JOIN apartados_cli ap ON ap.cliente_id = c.id
+        LEFT JOIN puntualidad pu ON pu.cliente_id = c.id
+        ORDER BY c.id
+    """)
+    columnas = ['cliente_id', 'nombre', 'num_compras', 'ticket_promedio', 'num_apartados', 'monto_apartado_promedio', 'usa_apartados', 'puntualidad_pago']
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return pd.DataFrame(rows, columns=columnas)
+
+DESCRIPCIONES_SEGMENTO = {
+    'Cliente Frecuente de Alto Gasto': 'Muchas compras, ticket alto',
+    'Cliente Ocasional': 'Pocas compras, ticket bajo',
+    'Cliente Apartador': 'Usa el sistema de apartados',
+}
+ACCIONES_SEGMENTO = {
+    'Cliente Frecuente de Alto Gasto': 'Atencion personalizada y piezas exclusivas',
+    'Cliente Ocasional': 'Campanas de reactivacion y promociones especiales',
+    'Cliente Apartador': 'Recordatorio de saldo pendiente y oferta de nuevo apartado al liquidar',
+}
+
+def entrenar_segmentacion(df):
+    """
+    K-Means (k=3) sobre variables de comportamiento del cliente, todas estandarizadas.
+    El nombre de cada cluster se asigna dinamicamente segun las caracteristicas de su
+    centroide (no por indice fijo, ya que el orden de los clusters de K-Means es arbitrario).
+    """
+    variables = ['num_compras', 'ticket_promedio', 'num_apartados', 'monto_apartado_promedio', 'usa_apartados', 'puntualidad_pago']
+    X = df[variables].values
+
+    scaler = StandardScaler()
+    X_escalado = scaler.fit_transform(X)
+
+    kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
+    df = df.copy()
+    df['cluster'] = kmeans.fit_predict(X_escalado)
+
+    centroides = pd.DataFrame(scaler.inverse_transform(kmeans.cluster_centers_), columns=variables)
+    cluster_apartador = centroides['usa_apartados'].idxmax()
+    restantes = [c for c in centroides.index if c != cluster_apartador]
+    cluster_frecuente = centroides.loc[restantes, 'ticket_promedio'].idxmax()
+    cluster_ocasional = [c for c in restantes if c != cluster_frecuente][0]
+
+    nombres_segmento = {
+        cluster_frecuente: 'Cliente Frecuente de Alto Gasto',
+        cluster_ocasional: 'Cliente Ocasional',
+        cluster_apartador: 'Cliente Apartador',
+    }
+    df['segmento'] = df['cluster'].map(nombres_segmento)
+
+    pca = PCA(n_components=2, random_state=42)
+    coords = pca.fit_transform(X_escalado)
+    df['pca_x'] = coords[:, 0]
+    df['pca_y'] = coords[:, 1]
+
+    return df
+
+def obtener_segmentacion_cacheada():
+    ahora = time.time()
+    df = obtener_clientes()
+
+    cache_valida = (
+        _cache_segmentacion["resultado"] is not None
+        and (ahora - _cache_segmentacion["timestamp"]) < CACHE_TTL_SEGUNDOS
+        and _cache_segmentacion["total_clientes"] == len(df)
+    )
+    if cache_valida:
+        return _cache_segmentacion["resultado"]
+
+    df_segmentado = entrenar_segmentacion(df)
+    _cache_segmentacion.update({
+        "timestamp": ahora,
+        "total_clientes": len(df),
+        "resultado": df_segmentado,
+    })
+    return df_segmentado
+
+@app.route('/segmentos', methods=['GET'])
+def ver_segmentos():
+    try:
+        df = obtener_segmentacion_cacheada()
+
+        if len(df) < 6:
+            return jsonify({ "error": "Catalogo de clientes insuficiente para segmentar (minimo 6)" }), 400
+
+        resumen = df['segmento'].value_counts().to_dict()
+        segmentos = [{
+            "nombre": nombre,
+            "clientes": int(count),
+            "descripcion": DESCRIPCIONES_SEGMENTO.get(nombre, ''),
+            "accion": ACCIONES_SEGMENTO.get(nombre, ''),
+        } for nombre, count in resumen.items()]
+
+        clientes = [{
+            "id": int(row['cliente_id']),
+            "nombre": row['nombre'],
+            "num_compras": int(row['num_compras']),
+            "ticket_promedio": round(float(row['ticket_promedio']), 2),
+            "num_apartados": int(row['num_apartados']),
+            "monto_apartado_promedio": round(float(row['monto_apartado_promedio']), 2),
+            "usa_apartados": bool(row['usa_apartados']),
+            "segmento": row['segmento'],
+            "pca_x": round(float(row['pca_x']), 3),
+            "pca_y": round(float(row['pca_y']), 3),
+        } for _, row in df.iterrows()]
+
+        return jsonify({
+            "algoritmo": "kmeans",
+            "total_clientes": len(df),
+            "segmentos": segmentos,
+            "clientes": clientes,
         })
 
     except Exception as e:

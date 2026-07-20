@@ -1,8 +1,8 @@
 import os
 import psycopg2
 import pandas as pd
-from mlxtend.frequent_patterns import apriori, association_rules
-from mlxtend.preprocessing import TransactionEncoder
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics.pairwise import cosine_similarity
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -15,43 +15,68 @@ CORS(app)
 def get_connection():
     return psycopg2.connect(os.getenv("DATABASE_URL"))
 
-def obtener_tickets():
+def obtener_productos():
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT v.id AS venta_id, dv.producto_nombre
-        FROM ventas v
-        JOIN detalle_ventas dv ON dv.venta_id = v.id
-        ORDER BY v.id
+        SELECT
+            p.id,
+            p.nombre,
+            p.material_principal,
+            c.nombre AS categoria,
+            p.peso_gramos,
+            p.dias_fabricacion,
+            p.permite_personalizacion
+        FROM productos p
+        JOIN categorias c ON p.categoria_id = c.id
+        WHERE p.activo = true
+        ORDER BY p.id
     """)
+    columnas = ['id', 'nombre', 'material_principal', 'categoria', 'peso_gramos', 'dias_fabricacion', 'permite_personalizacion']
     rows = cur.fetchall()
     cur.close()
     conn.close()
 
-    tickets = {}
-    for venta_id, producto in rows:
-        if venta_id not in tickets:
-            tickets[venta_id] = []
-        tickets[venta_id].append(producto)
+    return pd.DataFrame(rows, columns=columnas)
 
-    return list(tickets.values())
+def calcular_similitud(df):
+    df_features = df.copy()
 
-def entrenar_modelo(tickets):
-    te = TransactionEncoder()
-    te_array = te.fit(tickets).transform(tickets)
-    df = pd.DataFrame(te_array, columns=te.columns_)
+    le_material = LabelEncoder()
+    le_categoria = LabelEncoder()
 
-    frequent_itemsets = apriori(df, min_support=0.1, use_colnames=True)
+    df_features['material_enc'] = le_material.fit_transform(df['material_principal'])
+    df_features['categoria_enc'] = le_categoria.fit_transform(df['categoria'])
+    df_features['personalizacion_enc'] = df['permite_personalizacion'].astype(int)
 
-    if frequent_itemsets.empty:
-        return None
+    feature_cols = ['material_enc', 'categoria_enc', 'peso_gramos', 'dias_fabricacion', 'personalizacion_enc']
+    X = df_features[feature_cols].values
 
-    rules = association_rules(frequent_itemsets, metric="lift", min_threshold=1.1, num_itemsets=len(frequent_itemsets))
-    return rules
+    return cosine_similarity(X)
+
+def productos_similares(producto_id, df, sim_matrix, excluir_nombres, top_n=3):
+    indices = df[df['id'] == producto_id].index
+    if len(indices) == 0:
+        return []
+    idx = indices[0]
+
+    similitudes = list(enumerate(sim_matrix[idx]))
+    similitudes = sorted(similitudes, key=lambda x: x[1], reverse=True)
+    similitudes = [s for s in similitudes if s[0] != idx]
+
+    resultado = []
+    for i, score in similitudes:
+        nombre = df.iloc[i]['nombre']
+        if nombre in excluir_nombres:
+            continue
+        resultado.append({ "id": int(df.iloc[i]['id']), "nombre": nombre, "similitud": round(float(score), 4) })
+        if len(resultado) >= top_n:
+            break
+    return resultado
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({ "status": "ok", "servicio": "recomendacion" })
+    return jsonify({ "status": "ok", "servicio": "recomendacion", "algoritmo": "content-based-filtering-coseno" })
 
 @app.route('/recomendar', methods=['POST'])
 def recomendar():
@@ -62,65 +87,34 @@ def recomendar():
         return jsonify({ "error": "Debes enviar al menos un producto" }), 400
 
     try:
-        tickets = obtener_tickets()
+        df = obtener_productos()
 
-        if len(tickets) < 5:
-            return jsonify({ "recomendaciones": [], "mensaje": "Datos insuficientes para generar recomendaciones" })
+        if len(df) < 2:
+            return jsonify({ "recomendaciones": [], "mensaje": "Catálogo insuficiente para generar recomendaciones" })
 
-        rules = entrenar_modelo(tickets)
+        sim_matrix = calcular_similitud(df)
 
-        if rules is None or rules.empty:
-            return jsonify({ "recomendaciones": [], "mensaje": "No se encontraron patrones suficientes" })
+        # IDs de los productos que ya están en el carrito (para no recomendarlos de vuelta)
+        ids_carrito = df[df['nombre'].isin(productos_carrito)]['id'].tolist()
+        if not ids_carrito:
+            return jsonify({ "recomendaciones": [], "mensaje": "Ninguno de los productos del carrito está en el catálogo activo" })
 
-        recomendaciones = set()
-        for producto in productos_carrito:
-            filtro = rules[rules['antecedents'].apply(lambda x: producto in x)]
-            for _, row in filtro.iterrows():
-                for rec in row['consequents']:
-                    if rec not in productos_carrito:
-                        recomendaciones.add(rec)
+        candidatos = {}
+        for producto_id in ids_carrito:
+            similares = productos_similares(producto_id, df, sim_matrix, excluir_nombres=set(productos_carrito), top_n=3)
+            for item in similares:
+                actual = candidatos.get(item['nombre'])
+                if actual is None or item['similitud'] > actual['similitud']:
+                    candidatos[item['nombre']] = item
 
-        # Buscar IDs de los productos recomendados
-        nombres = list(recomendaciones)
-        conn2 = get_connection()
-        cur2 = conn2.cursor()
-        resultado = []
-        for nombre in nombres:
-            cur2.execute("SELECT id FROM productos WHERE nombre = %s LIMIT 1", (nombre,))
-            row = cur2.fetchone()
-            resultado.append({ "nombre": nombre, "id": row[0] if row else None })
-        cur2.close()
-        conn2.close()
+        resultado = sorted(candidatos.values(), key=lambda x: x['similitud'], reverse=True)[:5]
+        resultado = [{ "id": r["id"], "nombre": r["nombre"] } for r in resultado]
 
         return jsonify({
             "recomendaciones": resultado,
             "basado_en": productos_carrito,
-            "total_tickets_analizados": len(tickets)
+            "total_productos_catalogo": len(df)
         })
-
-    except Exception as e:
-        return jsonify({ "error": str(e) }), 500
-
-@app.route('/reglas', methods=['GET'])
-def ver_reglas():
-    try:
-        tickets = obtener_tickets()
-        rules = entrenar_modelo(tickets)
-
-        if rules is None or rules.empty:
-            return jsonify({ "reglas": [], "mensaje": "Sin patrones encontrados" })
-
-        resultado = []
-        for _, row in rules.iterrows():
-            resultado.append({
-                "si_compra": list(row['antecedents']),
-                "tambien_lleva": list(row['consequents']),
-                "soporte": round(float(row['support']), 3),
-                "confianza": round(float(row['confidence']), 3),
-                "lift": round(float(row['lift']), 3)
-            })
-
-        return jsonify({ "reglas": resultado, "total": len(resultado) })
 
     except Exception as e:
         return jsonify({ "error": str(e) }), 500

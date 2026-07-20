@@ -8,11 +8,19 @@ from sklearn.model_selection import cross_val_score, KFold
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
+import time
 
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
+
+# Cache en memoria del modelo de precio (entrenar Random Forest + validacion cruzada
+# es costoso: 6 entrenamientos por solicitud). Se reutiliza el modelo por 5 minutos
+# o hasta que cambie la cantidad de productos activos, para que solo la primera
+# solicitud pague el costo completo y las siguientes respondan casi al instante.
+_cache_modelo_precio = { "timestamp": 0, "total_productos": None, "modelo_rf": None, "scaler": None, "columnas_X": None, "mae": None }
+CACHE_TTL_SEGUNDOS = 300
 
 def get_connection():
     return psycopg2.connect(os.getenv("DATABASE_URL"))
@@ -206,6 +214,38 @@ def recomendar():
     except Exception as e:
         return jsonify({ "error": str(e) }), 500
 
+def obtener_modelo_precio_cacheado(df):
+    """
+    Reutiliza el modelo entrenado si tiene menos de CACHE_TTL_SEGUNDOS y el catalogo
+    no cambio de tamano. Entrenar (5-fold cross-validation + fit final) es costoso;
+    sin cache, cada solicitud tardaria ~10s en el plan gratuito de Render.
+    """
+    ahora = time.time()
+    cache_valida = (
+        _cache_modelo_precio["modelo_rf"] is not None
+        and (ahora - _cache_modelo_precio["timestamp"]) < CACHE_TTL_SEGUNDOS
+        and _cache_modelo_precio["total_productos"] == len(df)
+    )
+
+    if cache_valida:
+        return (
+            _cache_modelo_precio["modelo_rf"],
+            _cache_modelo_precio["scaler"],
+            _cache_modelo_precio["columnas_X"],
+            _cache_modelo_precio["mae"],
+        )
+
+    modelo_rf, scaler, columnas_X, mae = entrenar_modelo_precio(df)
+    _cache_modelo_precio.update({
+        "timestamp": ahora,
+        "total_productos": len(df),
+        "modelo_rf": modelo_rf,
+        "scaler": scaler,
+        "columnas_X": columnas_X,
+        "mae": mae,
+    })
+    return modelo_rf, scaler, columnas_X, mae
+
 @app.route('/predecir-precio', methods=['POST'])
 def predecir_precio():
     data = request.get_json() or {}
@@ -225,7 +265,7 @@ def predecir_precio():
         if len(df) < 5:
             return jsonify({ "error": "Catálogo insuficiente para entrenar el modelo de precio" }), 400
 
-        modelo_rf, scaler, columnas_X, mae = entrenar_modelo_precio(df)
+        modelo_rf, scaler, columnas_X, mae = obtener_modelo_precio_cacheado(df)
 
         precio_sugerido = predecir_precio_producto(
             modelo_rf, scaler, columnas_X,
@@ -262,7 +302,7 @@ def ver_precios_ejemplo():
         if len(df) < 5:
             return jsonify({ "resultado": [], "mensaje": "Catálogo insuficiente" })
 
-        modelo_rf, scaler, columnas_X, mae = entrenar_modelo_precio(df)
+        modelo_rf, scaler, columnas_X, mae = obtener_modelo_precio_cacheado(df)
 
         materiales = sorted(df['material_principal'].unique())
         categorias = sorted(df['categoria'].unique())
